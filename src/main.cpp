@@ -32,6 +32,14 @@ const char hiveUsername[] = "esp32s3";
 const char hivePassword[] = "Abc@@123";
 const uint16_t mqttPort = 8884;
 //"ESP32S3", "esp32s3", "Abc@@123"
+typedef struct LockerState
+{
+    String id;
+    bool isOpen;
+    String room;
+};
+
+LockerState ls;
 
 void st7735_init();
 void lvgl_init();
@@ -144,8 +152,9 @@ void closeLocker()
         {
             if (digitalRead(LED_PIN) == 1)
             {
-                mqttSendData("lockerState", "closed");
-                lv_label_set_text(lb_text, "Locker is closed");
+                ls.isOpen = false;
+                String payload = "{\"id\":\"" + ls.id + "\", \"room\":\"" + ls.room + "\", \"isOpen\":" + ls.isOpen + "}";
+                mqttSendData("tu_thiet_bi/STATUS", payload);
                 digitalWrite(LED_PIN, 0);
                 ledcWrite(4, angleToDuty(100));
             }
@@ -222,13 +231,16 @@ void mqttCallbacks()
         if (!doc["action"].isNull()) {
             String data = doc["action"].as<String>();
             String id = doc["id"].as<String>();
-            String room = doc[room].as<String>();
+            String room = doc["room"].as<String>();
+            ls.id = id;
+            ls.room = room;
             if(data == "open"){
                 digitalWrite(LED_PIN, 1);
                 ledcWrite(4, angleToDuty(180));
             }
-            String payload = "\"id\":" + id + "\"state: opened\"";
-            mqttSendData("tu_thiet_bi/ACTION", payload);
+            ls.isOpen = true;
+            String payload = "{\"id\":\"" + ls.id + "\", \"room\":\"" + ls.room + "\", \"isOpen\":" + ls.isOpen + "}";
+            mqttSendData("tu_thiet_bi/STATUS", payload);
             lv_label_set_text(lb_text, "Locker is opening");
         } 
     });
