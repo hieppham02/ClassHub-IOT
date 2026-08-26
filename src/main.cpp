@@ -7,12 +7,12 @@
 #include <String.h>
 #include <Preferences.h>
 
-#define SCREEN_WIDTH        128
-#define SCREEN_HEIGHT       160
-#define SERVO_PIN           37
-#define BUTTON_PIN          4
-#define LED_PIN             15
-#define DRAW_BUF_SIZE       (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * 2)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 160
+#define SERVO_PIN 37
+#define BUTTON_PIN 45
+#define LED_PIN 35
+#define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * 2)
 
 TFT_eSPI tft = TFT_eSPI();
 Preferences preferences;
@@ -28,9 +28,9 @@ const char ssid[] = "Quan Dat";
 const char pass[] = "012345678900";
 const char mqttUrl[] = "5f6dd65ef73945c2832e7dd2d5f3f8c4.s1.eu.hivemq.cloud";
 const char hiveClientId[] = "ESP32S3";
-const char hiveUsername [] = "esp32s3";
+const char hiveUsername[] = "esp32s3";
 const char hivePassword[] = "Abc@@123";
-const uint16_t mqttPort = 8884; 
+const uint16_t mqttPort = 8884;
 //"ESP32S3", "esp32s3", "Abc@@123"
 
 void st7735_init();
@@ -159,7 +159,7 @@ void mqttSendData(String topic, String payload)
     if (mqtt.isConnected())
     {
         mqtt.publish(topic, payload);
-        Serial.println("Sent: {\"" + topic + "\": \"" + payload + "\"}");
+        Serial.println("Sent: " + payload);
     }
 }
 
@@ -187,10 +187,10 @@ void mqttCallbacks()
         } });
 
     // Topic nhận OTP
-    mqtt.subscribe("otp", [](const String &payload, const size_t size)
-                   {
-        Serial.print("OTP: ");
-        Serial.println(payload);
+    String topic = "tu_thiet_bi/OTP";
+    mqtt.subscribe(topic, [topic](const String &payload, const size_t size)
+    {
+        Serial.println(topic + ": " + payload);
 
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, payload);
@@ -200,17 +200,16 @@ void mqttCallbacks()
             return;
         }
 
-        JsonObject objOtp = doc.as<JsonObject>();
         if (!doc["otp"].isNull()) {
-            String otpData = doc["otp"].as<String>();
-            lv_label_set_text(lb_text, otpData.c_str());
-        } });
+            String data = doc["otp"].as<String>();
+            lv_label_set_text(lb_text, data.c_str());
+        } 
+    });
 
-    // Topic nhận OTP
-    mqtt.subscribe("action", [](const String &payload, const size_t size)
+    // Topic
+    mqtt.subscribe("tu_thiet_bi/ACTION", [](const String &payload, const size_t size)
                    {
-        Serial.print("Received: ");
-        Serial.println(payload);
+        Serial.print("tu_thiet_bi/ACTION: " + payload);
 
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, payload);
@@ -220,27 +219,31 @@ void mqttCallbacks()
             return;
         }
 
-        JsonObject objOtp = doc.as<JsonObject>();
         if (!doc["action"].isNull()) {
-            String actionData = doc["action"].as<String>();
-            //Serial.println(actionData);
-            if(actionData == "open"){
+            String data = doc["action"].as<String>();
+            String id = doc["id"].as<String>();
+            String room = doc[room].as<String>();
+            if(data == "open"){
                 digitalWrite(LED_PIN, 1);
                 ledcWrite(4, angleToDuty(180));
             }
-            mqttSendData("lockerState","opened");
+            String payload = "\"id\":" + id + "\"state: opened\"";
+            mqttSendData("tu_thiet_bi/ACTION", payload);
             lv_label_set_text(lb_text, "Locker is opening");
-        } });
+        } 
+    });
 }
 
-uint32_t angleToDuty(uint8_t angle) {
+uint32_t angleToDuty(uint8_t angle)
+{
     return map(angle, 0, 180, 410, 2048);
 }
 
 void setup()
 {
     Serial.begin(115200);
-
+    while (!Serial && millis() < 3000)
+        ;
     st7735_init();
     lvgl_init();
     displayOnScreen();
@@ -256,7 +259,7 @@ void setup()
     ledcAttachPin(SERVO_PIN, 4);
     ledcWrite(4, angleToDuty(90));
 
-    //analogReadResolution(12);
+    // analogReadResolution(12);
 }
 
 void loop()
