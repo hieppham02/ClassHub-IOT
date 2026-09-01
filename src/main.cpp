@@ -1,71 +1,85 @@
+#include <Arduino.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <MQTTPubSubClient.h>
-#include <String.h>
-#include <Preferences.h>
 
-#define SCREEN_WIDTH 128
+#define CABINET_ID   "DTD201"
+#define CABINET_NAME "Tu DTD-201"
+
+#define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 160
-#define SERVO_PIN 37
-#define BUTTON_PIN 45
-#define LED_PIN 35
 #define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * 2)
 
-TFT_eSPI tft = TFT_eSPI();
-Preferences preferences;
-WebSocketsClient client;
-MQTTPubSubClient mqtt;
+#define SERVO_PIN     37
+#define BUTTON_PIN    42
+#define LED_PIN       35
 
-uint8_t draw_buf[DRAW_BUF_SIZE];
-lv_obj_t *lb_text;
-static uint32_t click_count = 0;
-uint32_t lastBtn = 0;
+#define SERVO_CHANNEL 4
+#define SERVO_LOCKED_ANGLE   90
+#define SERVO_UNLOCKED_ANGLE 180
 
 const char ssid[] = "Quan Dat";
 const char pass[] = "012345678900";
-const char mqttUrl[] = "5f6dd65ef73945c2832e7dd2d5f3f8c4.s1.eu.hivemq.cloud";
-const char hiveClientId[] = "ESP32S3";
-const char hiveUsername[] = "esp32s3";
-const char hivePassword[] = "Abc@@123";
+
+
+uint8_t stableDoorState = LOW;
+uint8_t lastRawDoorState = LOW;
+unsigned long lastDoorDebounceTime = 0;
+const unsigned long DOOR_DEBOUNCE_DELAY = 50;
+
+const char mqttHost[] = "5f6dd65ef73945c2832e7dd2d5f3f8c4.s1.eu.hivemq.cloud";
 const uint16_t mqttPort = 8884;
-//"ESP32S3", "esp32s3", "Abc@@123"
-typedef struct LockerState
-{
-    String id;
-    bool isOpen;
-    String room;
+const char mqttUsername[] = "esp32s3";
+const char mqttPassword[] = "Abc@@123";
+
+const String TOPIC_SUB_OTP    = "backend/cabinet/" + String(CABINET_ID) + "/otp";
+const String TOPIC_SUB_ACTION = "backend/cabinet/" + String(CABINET_ID) + "/action";
+const String TOPIC_PUB_STATUS = "iot/cabinet/" + String(CABINET_ID) + "/status";
+
+TFT_eSPI tft = TFT_eSPI();
+WebSocketsClient client;
+
+MQTTPubSubClient mqtt;
+//arduino::mqtt::PubSubClient<512, 16> mqtt;
+
+uint8_t draw_buf[DRAW_BUF_SIZE];
+lv_obj_t *lb_header;
+lv_obj_t *lb_status;
+lv_obj_t *lb_otp;
+lv_obj_t *lb_network;
+
+struct CabinetState {
+    String currentSlipId = "";
+    bool isOpen = false;
+    bool isOnline = false;
+} cabState;
+
+enum PendingAction { 
+    ACTION_NONE, 
+    ACTION_OPEN, 
+    ACTION_LOCK 
 };
+PendingAction pendingAction = ACTION_NONE;
+String pendingSlipId = "";
 
-LockerState ls;
+unsigned long unlockTimestamp = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastReconnectAttempt = 0;
+const unsigned long HEARTBEAT_INTERVAL = 15000;
+uint32_t lastBtnState = 0;
 
-void st7735_init();
-void lvgl_init();
-void displayFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map);
-void displayOnScreen();
-void mqtt_init();
-void closeLocker();
-void mqttSendData(String topic, String payload);
-void mqttCallbacks();
-uint32_t angleToDuty(uint8_t angle);
-
-void st7735_init()
-{
-    tft.init();
-    tft.setRotation(0);
-    tft.fillScreen(TFT_BLACK);
+uint32_t angleToDuty(uint8_t angle) {
+    return map(angle, 0, 180, 410, 2048);
 }
 
-void lvgl_init()
-{
-    lv_init();
-    lv_tick_set_cb((uint32_t (*)(void))millis);
+void setServoAngle(uint8_t angle) {
+    ledcWrite(SERVO_CHANNEL, angleToDuty(angle));
 }
 
-void displayFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
-{
+void displayFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = lv_area_get_width(area);
     uint32_t h = lv_area_get_height(area);
     tft.startWrite();
@@ -75,214 +89,238 @@ void displayFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     lv_display_flush_ready(disp);
 }
 
-void displayOnScreen()
-{
+void initScreenUI() {
     lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
     lv_display_set_flush_cb(disp, displayFlush);
     lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x0000), LV_PART_MAIN);
 
-    lb_text = lv_label_create(lv_screen_active());
-    lv_obj_set_width(lb_text, 128);
-    lv_obj_set_height(lb_text, LV_SIZE_CONTENT);
-    lv_obj_set_style_text_color(lb_text, lv_color_hex(0xffffff), LV_PART_MAIN);
-    lv_label_set_text_fmt(lb_text, "%d", click_count);
-    lv_obj_set_style_text_align(lb_text, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lb_text, LV_ALIGN_TOP_MID, 0, 160 / 2);
-    lv_label_set_long_mode(lb_text, LV_LABEL_LONG_MODE_WRAP);
+    lb_header = lv_label_create(lv_screen_active());
+    lv_obj_set_width(lb_header, SCREEN_WIDTH);
+    lv_obj_set_style_text_color(lb_header, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_align(lb_header, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lb_header, LV_ALIGN_TOP_MID, 0, 8);
+    lv_label_set_text_fmt(lb_header, "CLASSHUB\n%s", CABINET_NAME);
+
+    lb_status = lv_label_create(lv_screen_active());
+    lv_obj_set_width(lb_status, SCREEN_WIDTH);
+    lv_obj_set_style_text_color(lb_status, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_align(lb_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lb_status, LV_ALIGN_CENTER, 0, -8);
+    lv_label_set_text(lb_status, "Dang khoi dong...");
+
+    lb_otp = lv_label_create(lv_screen_active());
+    lv_obj_set_width(lb_otp, SCREEN_WIDTH);
+    lv_obj_set_style_text_color(lb_otp, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_align(lb_otp, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lb_otp, LV_ALIGN_CENTER, 0, 20);
+    lv_label_set_text(lb_otp, "");
+
+    lb_network = lv_label_create(lv_screen_active());
+    lv_obj_set_width(lb_network, SCREEN_WIDTH);
+    lv_obj_set_style_text_color(lb_network, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    lv_obj_set_style_text_align(lb_network, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lb_network, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_label_set_text(lb_network, "MANG: OFFLINE");
 }
 
-void mqtt_init()
-{
-    Serial.println("Connecting to wifi...");
-    lv_label_set_text(lb_text, "Connecting to wifi...");
-    lv_timer_handler();
+void sendMqttStatus(bool isOpen, bool isOnline, const String &slipId = "") {
+    if (!mqtt.isConnected()) return;
 
+    JsonDocument doc;
+    doc["id"] = slipId.length() > 0 ? slipId : cabState.currentSlipId;
+    doc["room"] = CABINET_ID;
+    doc["isOpen"] = isOpen;
+    doc["isOnline"] = isOnline;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    mqtt.publish(TOPIC_PUB_STATUS, payload);
+    Serial.println("[MQTT Sent -> Status] " + payload);
+}
+
+void executeUnlock(const String &slipId = "") {
+    cabState.isOpen = true;
+    unlockTimestamp = millis();
+    if (slipId.length() > 0) cabState.currentSlipId = slipId;
+
+    digitalWrite(LED_PIN, HIGH);
+    setServoAngle(SERVO_UNLOCKED_ANGLE);
+
+    sendMqttStatus(true, true);
+
+    lv_label_set_text(lb_status, "CUA DANG MO");
+    lv_obj_set_style_text_color(lb_status, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    Serial.println(">> [SERVO] DA MO CHOT THANH CONG!");
+}
+
+void executeLock() {
+    cabState.isOpen = false;
+
+    digitalWrite(LED_PIN, LOW);
+    setServoAngle(SERVO_LOCKED_ANGLE);
+
+    sendMqttStatus(false, true);
+
+    lv_label_set_text(lb_status, "DA KHOA");
+    lv_label_set_text(lb_otp, "");
+    lv_obj_set_style_text_color(lb_status, lv_color_hex(0xFFFF), LV_PART_MAIN);
+    Serial.println(">> [SERVO] DA KHOA CHOT THANH CONG!");
+}
+
+void handleDoorSensor() {
+    
+    uint8_t currentRaw = digitalRead(BUTTON_PIN);
+    if (currentRaw != lastRawDoorState) {
+        lastDoorDebounceTime = millis(); 
+    }
+    if ((millis() - lastDoorDebounceTime) > DOOR_DEBOUNCE_DELAY) {
+        if (currentRaw != stableDoorState) {
+            stableDoorState = currentRaw;
+            if (stableDoorState == HIGH && cabState.isOpen) {
+                Serial.println(">> [SENSOR] Dong cua tu cong tac!");
+                pendingAction = ACTION_LOCK;
+            }
+        }
+    }
+    lastRawDoorState = currentRaw;
+}
+
+void setupMqttCallbacks() {
+    // 1. Nhận mã OTP
+    mqtt.subscribe(TOPIC_SUB_OTP, [](const String &payload, const size_t size) {
+        Serial.println("[MQTT Recv -> OTP] " + payload);
+
+        JsonDocument doc;
+        if (deserializeJson(doc, payload)) return;
+
+        String targetRoom = doc["room"] | "";
+        if (targetRoom == CABINET_ID || targetRoom == "") {
+            String otp = doc["otp"] | "";
+            String id = doc["id"] | "";
+            cabState.currentSlipId = id;
+
+            if (otp.length() > 0) {
+                lv_label_set_text(lb_status, "MA OTP:");
+                lv_label_set_text_fmt(lb_otp, "%s", otp.c_str());
+                lv_obj_set_style_text_color(lb_status, lv_color_hex(0xFFFF), LV_PART_MAIN);
+                Serial.println(">> [OTP HIEN THI] Ma: " + otp);
+            }
+        }
+    });
+
+    // 2. Nhận Action (Mở / Khóa)
+    mqtt.subscribe(TOPIC_SUB_ACTION, [](const String &payload, const size_t size) {
+        Serial.println("[MQTT Recv -> ACTION] " + payload);
+
+        JsonDocument doc;
+        if (deserializeJson(doc, payload)) return;
+
+        String targetRoom = doc["room"] | "";
+        String action = doc["action"] | "";
+        String id = doc["id"] | "";
+        long timestamp = doc["ts"] | 0;
+
+        Serial.printf(">> [CMD] Room: %s | Action: %s | TS: %ld\n", targetRoom.c_str(), action.c_str(), timestamp);
+
+        // Kiểm tra đúng phòng mới xử lý
+        if (targetRoom == CABINET_ID || targetRoom == "") {
+            if (action == "open") {
+                pendingAction = ACTION_OPEN;
+                pendingSlipId = id;
+            } else if (action == "lock" || action == "close") {
+                pendingAction = ACTION_LOCK;
+            }
+        }
+    });
+}
+
+void connectMQTT() {
+    String uniqueClientId = "ESP32S3_" + String(CABINET_ID);
+    Serial.print("Dang ket noi MQTT (" + uniqueClientId + ")... ");
+
+    if (mqtt.connect(uniqueClientId, String(mqttUsername), String(mqttPassword))) {
+        Serial.println("THANH CONG!");
+        cabState.isOnline = true;
+
+        lv_label_set_text(lb_status, "SAN SANG");
+        lv_label_set_text(lb_network, "MANG: ONLINE");
+        lv_obj_set_style_text_color(lb_status, lv_color_hex(0xFFFF), LV_PART_MAIN);
+        lv_obj_set_style_text_color(lb_network, lv_color_hex(0xFFFF), LV_PART_MAIN);
+
+        setupMqttCallbacks();
+        sendMqttStatus(cabState.isOpen, true);
+    } else {
+        Serial.println("THAT BAI!");
+        lv_label_set_text(lb_network, "MANG: OFFLINE");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    while(!Serial && millis() < 3000);
+
+    pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    ledcSetup(SERVO_CHANNEL, 50, 14);
+    ledcAttachPin(SERVO_PIN, SERVO_CHANNEL);
+    setServoAngle(SERVO_LOCKED_ANGLE);
+
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(TFT_BLACK);
+
+    lv_init();
+    lv_tick_set_cb((uint32_t (*)(void))millis);
+    initScreenUI();
+
+    WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
-
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.print("...");
-        delay(500);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(400);
+        Serial.print(".");
         lv_timer_handler();
     }
-    Serial.println("\nConnected to WiFi!");
-    lv_label_set_text(lb_text, "Connected to WiFi!");
-    lv_timer_handler();
-    delay(200);
-
-    Serial.println("Connecting to host...");
-    lv_label_set_text(lb_text, "Connecting to host...");
-    lv_timer_handler();
+    Serial.println("\nWiFi OK!");
 
     mqtt.begin(client);
-    client.disconnect();
-
-    const char *maqtt_server = mqttUrl;
-    client.beginSSL(maqtt_server, mqttPort, "/mqtt");
+    client.beginSSL(mqttHost, mqttPort, "/mqtt");
     client.setReconnectInterval(2000);
 
-    Serial.println("Connecting to MQTT Broker...");
-    lv_label_set_text(lb_text, "Connecting to MQTT Broker...");
-    lv_timer_handler();
-
-    while (!mqtt.connect("ESP32S3", "esp32s3", "Abc@@123"))
-    {
-        Serial.print(".");
-        delay(500);
-        lv_timer_handler();
-    }
-    Serial.println("Connected to MQTT Broker!");
-    lv_label_set_text(lb_text, "Connected to MQTT Broker!");
-    lv_timer_handler();
+    connectMQTT();
 }
 
-void closeLocker()
-{
-    uint8_t currentBtn = digitalRead(BUTTON_PIN);
-    if (currentBtn == 1 && lastBtn == 0)
-    {
-        delay(50);
-        // if (digitalRead(BUTTON_PIN) == 1) {
-        //     click_count++;
-        //     preferences.putUInt("count", click_count);
-        //     lv_label_set_text_fmt(label_count, "%d", click_count);
-        // }
-        if (digitalRead(BUTTON_PIN) == 1)
-        {
-            if (digitalRead(LED_PIN) == 1)
-            {
-                ls.isOpen = false;
-                String payload = "{\"id\":\"" + ls.id + "\", \"room\":\"" + ls.room + "\", \"isOpen\":" + ls.isOpen + "}";
-                mqttSendData("tu_thiet_bi/STATUS", payload);
-                digitalWrite(LED_PIN, 0);
-                ledcWrite(4, angleToDuty(100));
-            }
-        }
-    }
-    lastBtn = currentBtn;
-}
-
-void mqttSendData(String topic, String payload)
-{
-    if (mqtt.isConnected())
-    {
-        mqtt.publish(topic, payload);
-        Serial.println("Sent: " + payload);
-    }
-}
-
-void mqttCallbacks()
-{
-    // Topic điều khiển led
-    mqtt.subscribe("data", [](const String &payload, const size_t size)
-                   {
-        Serial.print("Received: ");
-        Serial.println(payload);
-
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, payload);
-
-        if(error) {
-            Serial.println(error.f_str());
-            return;
-        }
-
-        JsonObject objLed = doc.as<JsonObject>();
-        if(!doc["led"].isNull()) {
-            int ledState = doc["led"];
-            digitalWrite(LED_PIN, ledState);
-            //mqttSendData("led", String(ledState));
-        } });
-
-    // Topic nhận OTP
-    String topic = "tu_thiet_bi/OTP";
-    mqtt.subscribe(topic, [topic](const String &payload, const size_t size)
-    {
-        Serial.println(topic + ": " + payload);
-
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, payload);
-
-        if (error) {
-            Serial.println(error.f_str());
-            return;
-        }
-
-        if (!doc["otp"].isNull()) {
-            String data = doc["otp"].as<String>();
-            lv_label_set_text(lb_text, data.c_str());
-        } 
-    });
-
-    // Topic
-    mqtt.subscribe("tu_thiet_bi/ACTION", [](const String &payload, const size_t size)
-                   {
-        Serial.print("tu_thiet_bi/ACTION: " + payload);
-
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, payload);
-
-        if (error) {
-            Serial.println(error.f_str());
-            return;
-        }
-
-        if (!doc["action"].isNull()) {
-            String data = doc["action"].as<String>();
-            String id = doc["id"].as<String>();
-            String room = doc["room"].as<String>();
-            ls.id = id;
-            ls.room = room;
-            if(data == "open"){
-                digitalWrite(LED_PIN, 1);
-                ledcWrite(4, angleToDuty(180));
-            }
-            ls.isOpen = true;
-            String payload = "{\"id\":\"" + ls.id + "\", \"room\":\"" + ls.room + "\", \"isOpen\":" + ls.isOpen + "}";
-            mqttSendData("tu_thiet_bi/STATUS", payload);
-            lv_label_set_text(lb_text, "Locker is opening");
-        } 
-    });
-}
-
-uint32_t angleToDuty(uint8_t angle)
-{
-    return map(angle, 0, 180, 410, 2048);
-}
-
-void setup()
-{
-    Serial.begin(115200);
-    while (!Serial && millis() < 3000)
-        ;
-    st7735_init();
-    lvgl_init();
-    displayOnScreen();
-
-    mqtt_init();
-    mqttCallbacks();
-
-    pinMode(BUTTON_PIN, INPUT);
-    pinMode(5, INPUT);
-    pinMode(LED_PIN, OUTPUT);
-
-    ledcSetup(4, 50, 14);
-    ledcAttachPin(SERVO_PIN, 4);
-    ledcWrite(4, angleToDuty(90));
-
-    // analogReadResolution(12);
-}
-
-void loop()
-{
-    closeLocker();
+void loop() {
     client.loop();
     mqtt.update();
     lv_timer_handler();
-    delay(5);
 
-    // int rawValue = analogRead(6);
-    // int angle = map(rawValue, 0, 4095, 0, 180);
-    // ledcWrite(4, angleToDuty(angle));
+    if (!mqtt.isConnected() && millis() - lastReconnectAttempt > 5000) {
+        lastReconnectAttempt = millis();
+        Serial.println("[MQTT] Thu ket noi lai...");
+        connectMQTT();
+    }
+
+    if (pendingAction == ACTION_OPEN) {
+        pendingAction = ACTION_NONE;
+        executeUnlock(pendingSlipId);
+    } else if (pendingAction == ACTION_LOCK) {
+        pendingAction = ACTION_NONE;
+        executeLock();
+    }
+
+    handleDoorSensor();
+
+    // Gửi Heartbeat 15s/lần
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+        lastHeartbeat = millis();
+        if (mqtt.isConnected()) {
+            sendMqttStatus(cabState.isOpen, true);
+        }
+    }
+
+    delay(5);
 }
