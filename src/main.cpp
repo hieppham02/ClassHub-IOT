@@ -13,7 +13,7 @@
 #define DRAW_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10 * 2)
 
 #define SERVO_PIN 37
-#define DOOR_SENSOR_PIN 42 // button :))
+#define DOOR_BUTTON 42 // button :))
 #define LED_PIN 35
 #define WIFI_CONFIG_BUTTON_PIN 15
 
@@ -250,7 +250,7 @@ void executeLock()
 
 void handleDoorSensor()
 {
-    uint8_t currentRawState = digitalRead(DOOR_SENSOR_PIN);
+    uint8_t currentRawState = digitalRead(DOOR_BUTTON);
 
     if (currentRawState != lastRawDoorState)
         lastDoorDebounceTime = millis();
@@ -433,7 +433,7 @@ void setup()
     initMqttConfig();
 
     pinMode(WIFI_CONFIG_BUTTON_PIN, INPUT_PULLDOWN);
-    pinMode(DOOR_SENSOR_PIN, INPUT_PULLDOWN);
+    pinMode(DOOR_BUTTON, INPUT_PULLDOWN);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
